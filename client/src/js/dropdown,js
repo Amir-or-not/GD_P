@@ -1,0 +1,61 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+
+/**
+ * Custom React hook for handling dropdown functionality
+ * @param {boolean} initialState - Initial state of the dropdown (open or closed)
+ * @returns {Array} [isOpen, setIsOpen, toggleDropdown, dropdownRef, triggerRef]
+ */
+const useDropdown = (initialState = false) => {
+  // State to track if dropdown is open/closed
+  const [isOpen, setIsOpen] = useState(initialState);
+  
+  // Refs for the dropdown container and trigger button
+  const dropdownRef = useRef(null);
+  const triggerRef = useRef(null);
+  
+  // Toggle function to open/close the dropdown
+  const toggleDropdown = useCallback(() => {
+    setIsOpen(prevState => !prevState);
+  }, []);
+  
+  // Function to close dropdown when clicking outside
+  const handleClickOutside = useCallback((event) => {
+    if (
+      dropdownRef.current && 
+      triggerRef.current && 
+      !dropdownRef.current.contains(event.target) && 
+      !triggerRef.current.contains(event.target)
+    ) {
+      setIsOpen(false);
+    }
+  }, []);
+  
+  // Add event listener for clicking outside when dropdown is open
+  useEffect(() => {
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isOpen, handleClickOutside]);
+  
+  // Close dropdown on ESC key press
+  useEffect(() => {
+    const handleEscapeKey = (event) => {
+      if (event.key === 'Escape' && isOpen) {
+        setIsOpen(false);
+      }
+    };
+    
+    document.addEventListener('keydown', handleEscapeKey);
+    return () => {
+      document.removeEventListener('keydown', handleEscapeKey);
+    };
+  }, [isOpen]);
+  
+  return [isOpen, setIsOpen, toggleDropdown, dropdownRef, triggerRef];
+};
+
+export default useDropdown;

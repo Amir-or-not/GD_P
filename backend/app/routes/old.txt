@@ -1,0 +1,408 @@
+from fastapi import APIRouter, Request, Form, Depends, HTTPException
+from fastapi.templating import Jinja2Templates
+from datetime import datetime
+from fastapi.responses import RedirectResponse
+from app.database import get_db_connection
+# from app.routes import products
+from psycopg2 import Binary
+import psycopg2.extras
+from pydantic import BaseModel
+import hashlib
+import base64
+import os
+
+salt = os.urandom(16)
+
+router = APIRouter()
+
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: int
+    created_at: int
+    # role = 'user'
+
+templates = Jinja2Templates(directory="app/templates")
+
+@router.get("/register/")
+def show_registration_page(request: Request):
+    return templates.TemplateResponse("register.html", {"request": request})
+
+@router.get("/users/")
+def get_users(request: Request):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users")
+    # cur.execute("SELECT id, name FROM users")
+    users = cur.fetchall()
+    cur.close()
+    conn.close()
+    return templates.TemplateResponse("start.html", {"request": request, "users": users})
+
+@router.post("/users/")
+def create_user(
+    name: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...)
+):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        hashed_password = hashlib.pbkdf2_hmac(
+            'sha256',  
+            password.encode('utf-8'),  
+            salt, 
+            100000,  
+            dklen=32 
+        )
+        email = email.strip()
+        email = email.lower()
+        cur.execute(
+            "INSERT INTO users (username, email, password_hash, salt, created_at, role) VALUES (%s, %s, %s, %s, NOW(), %s) RETURNING user_id",
+            (name, email, hashed_password, salt, "user")
+        )
+
+
+        row = cur.fetchone()
+        print("DEBUG: fetchone() output ->", row) 
+        
+        if not row:
+            raise HTTPException(status_code=500, detail="Ошибка при создании пользователя (id не получен)")
+
+        conn.commit()
+
+        return RedirectResponse(url="/login/", status_code=303)
+
+    except Exception as e:
+        conn.rollback()
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Ошибка SQL: {e}\nДетали:\n{error_details}")  
+        raise HTTPException(status_code=500, detail=f"Ошибка SQL: {str(e)}")
+
+    finally:
+        cur.close()
+        conn.close()
+
+@router.post("/login/")
+async def login_user(email: str = Form(...), password: str = Form(...)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        try:
+            cur.execute("SELECT user_id, password_hash, salt FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+        except Exception as e:
+            print(f"DEBUG: Ошибка при выполнении запроса: {e}")
+            raise HTTPException(status_code=500, detail="Ошибка при запросе к базе данных")
+        
+        if not user:
+            raise HTTPException(status_code=400, detail="Неверный email или пароль")
+
+
+        user_id = user["user_id"]
+        stored_password = user["password_hash"]
+        stored_salt = user["salt"]
+
+        try:
+            user_id = int(user_id)
+        except ValueError:
+            raise HTTPException(status_code=500, detail=f"Ошибка: id={user_id} (ожидался int)")
+
+        hashed_input_password = hashlib.pbkdf2_hmac(
+            'sha256',  
+            password.encode('utf-8'),  
+            stored_salt, 
+            100000,  
+            dklen=32 
+        )
+
+        if hashed_input_password != bytes.fromhex(stored_password[2:]): 
+            raise HTTPException(status_code=400, detail="Неверный email или пароль")
+        
+        # return {"message": "вход выполнен успешно", "user_id": user_id}
+        response = RedirectResponse(url="/home/", status_code=303)
+        response.set_cookie(key="user_id", value=str(user_id))  
+        return response
+    
+
+
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        raise HTTPException(status_code=500, detail="Неверный email или пароль")
+
+    finally:
+        cur.close()
+        conn.close()
+
+@router.get("/profile/")
+@router.post("/profile/")
+async def profile(request: Request, username: str = Form(None), email: str = Form(None), full_name: str = Form(None), phone: str = Form(None)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    user_id = request.cookies.get("user_id")
+    
+    profile_data = {}
+
+    if request.method == "GET":
+        try:
+            cur.execute("SELECT user_id, username, email, full_name, phone, avatar, created_at FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            if row:
+                profile_data = {
+                    "id": row['user_id'],
+                    "username": row['username'],
+                    "email": row['email'],
+                    "full_name": row['full_name'] or '',
+                    "phone": row['phone'] or '',
+                    "avatar": row['avatar'] or "/static/images/g.webp",
+                    "created_at": row['created_at'].strftime("%B %Y")
+                }
+        finally:
+            cur.close()
+            conn.close()
+
+        return templates.TemplateResponse("profile.html", {
+            "request": request,
+            "user": profile_data
+        })
+
+    elif request.method == "POST":
+        if username and email and full_name and phone:
+            try:
+                cur.execute("""
+                    UPDATE users
+                    SET username = %s, email = %s, full_name = %s, phone = %s
+                    WHERE user_id = %s
+                """, (username, email, full_name, phone, user_id))
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+
+        return RedirectResponse("/profile/", status_code=303)
+
+
+
+@router.post("/change-password/")
+async def change_password(
+    request: Request,
+    currentPassword: str = Form(...),
+    newPassword: str = Form(...),
+    confirmPassword: str = Form(...),
+):
+    user_id = request.cookies.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User not logged in")
+
+    if newPassword != confirmPassword:
+        raise HTTPException(status_code=400, detail="Passwords do not match")
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    try:
+        cur.execute("SELECT password_hash, salt FROM users WHERE user_id = %s", (user_id,))
+        result = cur.fetchone()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        stored_password_hash = result['password_hash']  
+        stored_salt = result['salt']  
+
+        if isinstance(stored_salt, memoryview):
+            stored_salt = stored_salt.tobytes()
+
+        print("🔐 Stored hash:", stored_password_hash)
+        print("🔑 Stored salt:", stored_salt)
+
+        try:
+            stored_password_hash_bytes = base64.b64decode(stored_password_hash)
+            print("🔑 Stored password hash (base64 decoded):", stored_password_hash_bytes)
+        except Exception as e:
+            print("Ошибка при декодировании base64:", e)
+            stored_password_hash_bytes = None
+
+        if stored_password_hash_bytes is None:
+            try:
+                stored_password_hash_bytes = bytes.fromhex(stored_password_hash)
+                print("🔑 Stored password hash (hex decoded):", stored_password_hash_bytes)
+            except Exception as e:
+                print("Ошибка при декодировании hex:", e)
+                stored_password_hash_bytes = None
+
+        if stored_password_hash_bytes is None:
+            raise HTTPException(status_code=500, detail="Stored password hash is not in valid format")
+
+        hashed_input_password = hashlib.pbkdf2_hmac(
+            'sha256',
+            currentPassword.encode('utf-8'),
+            stored_salt,
+            100000,
+            dklen=32
+        )
+
+        print("🔑 Input hash:", hashed_input_password)
+
+        if hashed_input_password != stored_password_hash_bytes:
+            raise HTTPException(status_code=400, detail="Incorrect current password")
+
+        new_salt = os.urandom(16)  
+        hashed_new_password = hashlib.pbkdf2_hmac(
+            'sha256',
+            newPassword.encode('utf-8'),
+            new_salt,
+            100000,
+            dklen=32
+        )
+
+        cur.execute(
+            "UPDATE users SET password_hash = %s, salt = %s WHERE user_id = %s",
+            (base64.b64encode(hashed_new_password).decode('utf-8'), new_salt, user_id)
+        )
+        conn.commit()
+
+    except Exception as e:
+        print("Ошибка при смене пароля:", e)
+        raise HTTPException(status_code=500, detail=f"Error updating password: {str(e)}")
+
+    finally:
+        cur.close()
+        conn.close()
+
+    return RedirectResponse("/profile/", status_code=303)
+
+
+
+
+
+
+
+
+
+
+
+
+вот тут старый роут продукт_дитэйл:
+
+@router.get("/product/{product_name}/")
+def product_detail(product_name: str, request: Request):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT product_id, product_name, description, price, image FROM products WHERE product_name = %s", (product_name,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        product = {
+            "id": row["product_id"],
+            "name": row["product_name"],
+            "description": row["description"] if row["description"] else "Нет описания.",
+            "price": row["price"],
+            "image": row["image"]
+        }
+
+        cur.execute("SELECT product_name, description, price FROM products WHERE product_id != %s", (product["id"],))
+        other_products = cur.fetchall()
+
+        formatted_data = "\n".join([
+            f"{p['product_name']} — {p['price']} ₸. {p['description'] or 'Нет описания'}"
+            for p in other_products
+        ])
+
+        prompt = (
+            f"Дан товар: {product['name']} — {product['price']} ₸. {product['description']}\n\n"
+            f"Вот другие товары:\n{formatted_data}\n\n"
+            "Выбери 4 наиболее похожих на основании полученных данных. Выведи только названия."
+        )
+
+        try:
+            response = model.generate_content(prompt)
+            similar_names = [name.strip() for name in response.text.split('\n') if name.strip()]
+        except Exception as e:
+            print("ERROR FROM GEMINI:", e)
+            similar_names = []
+
+        placeholders = ','.join(['%s'] * len(similar_names))
+        cur.execute(f"SELECT product_id, product_name, description, price, image FROM products WHERE product_name IN ({placeholders})", tuple(similar_names))
+        similar_products = cur.fetchall()
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+    return JSONResponse(content={"product": product, "similar_products": similar_products})
+
+
+
+
+
+@router.get("/product/{product_name}/")
+def product_detail(product_name: str, request: Request):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Получаем продукт
+        cur.execute("SELECT product_id, product_name, description, price, image FROM products WHERE product_name = %s", (product_name,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        product = {
+            "id": row["product_id"],
+            "name": row["product_name"],
+            "description": row["description"] if row["description"] else "Нет описания.",
+            "price": row["price"],
+            "image": row["image"]
+        }
+
+        # Получаем доступные цвета товара
+        cur.execute("SELECT color_name, image_path FROM product_colors WHERE product_id = %s", (product["id"],))
+        colors = cur.fetchall()
+
+        color_options = [
+            {"color": c["color_name"], "image": c["image_path"]}
+            for c in colors
+        ]
+
+        # Подбираем похожие товары
+        cur.execute("SELECT product_name, description, price FROM products WHERE product_id != %s", (product["id"],))
+        other_products = cur.fetchall()
+
+        formatted_data = "\n".join([
+            f"{p['product_name']} — {p['price']} ₸. {p['description'] or 'Нет описания'}"
+            for p in other_products
+        ])
+
+        prompt = (
+            f"Дан товар: {product['name']} — {product['price']} ₸. {product['description']}\n\n"
+            f"Вот другие товары:\n{formatted_data}\n\n"
+            "Выбери 4 наиболее похожих на основании полученных данных. Выведи только названия."
+        )
+
+        try:
+            response = model.generate_content(prompt)
+            similar_names = [name.strip() for name in response.text.split('\n') if name.strip()]
+        except Exception as e:
+            print("ERROR FROM GEMINI:", e)
+            similar_names = []
+
+        placeholders = ','.join(['%s'] * len(similar_names))
+        cur.execute(f"SELECT product_id, product_name, description, price, image FROM products WHERE product_name IN ({placeholders})", tuple(similar_names))
+        similar_products = cur.fetchall()
+
+    finally:
+        cur.close()
+        conn.close()
+
+    return JSONResponse(content={
+        "product": product,
+        "similar_products": similar_products,
+        "colors": color_options
+    })
